@@ -111,12 +111,33 @@ app = FastAPI(
     redoc_url=None,
     lifespan=lifespan,
 )
+
+# CORS added first so it wraps ALL responses including 401/422/500
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+# Force CORS headers on every response — including error responses
+# FastAPI CORSMiddleware sometimes strips headers from non-200 responses
+@app.middleware("http")
+async def force_cors(request: Request, call_next):
+    if request.method == "OPTIONS":
+        from fastapi.responses import Response as FR
+        r = FR(status_code=200)
+        r.headers["Access-Control-Allow-Origin"]  = "*"
+        r.headers["Access-Control-Allow-Headers"] = "*"
+        r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
+        return r
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
+    return response
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auth — X-API-Key
