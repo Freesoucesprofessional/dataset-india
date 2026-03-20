@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: subscriber-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: R2_ENDPOINT
+        sync: false          # Set manually in Render dashboard
+      - key: R2_ACCESS_KEY
+        sync: false
+      - key: R2_SECRET_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: PARQUET_FILE
+        value: data*.parquet
