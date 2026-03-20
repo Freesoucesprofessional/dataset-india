@@ -154,12 +154,44 @@ IND_PHONE_REGEX = re.compile(r"^[6-9]\d{9}$")
 EMAIL_REGEX     = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
 def validate_ind_phone(value: str) -> str:
-    cleaned = re.sub(r"[\s\-\(\)\+]", "", value.strip())
-    cleaned = re.sub(r"^(91)(?=[6-9])", "", cleaned)
-    if not IND_PHONE_REGEX.fullmatch(cleaned):
-        raise HTTPException(422, detail="Invalid Indian phone number. Expected 10 digits starting with 6–9.")
-    return cleaned
+    """
+    Normalises any Indian number format to 10 digits.
+    Accepted:
+      9811063283        (10 digits, plain)
+      +919811063283     (+91 prefix)
+      919811063283      (91 prefix, 12 digits)
+      09811063283       (leading 0)
+      +91 98110 63283   (spaces/dashes stripped)
+    Rejects any non-Indian or invalid number.
+    """
+    # strip spaces, dashes, dots, brackets, plus sign
+    cleaned = re.sub(r"[\s\-\.\(\)\+]", "", value.strip())
 
+    # strip country code 91 (handles: 91XXXXXXXXXX or 091XXXXXXXXXX or 0091XXXXXXXXXX)
+    if re.match(r"^0{0,2}91[6-9]\d{9}$", cleaned):
+        cleaned = re.sub(r"^0{0,2}91", "", cleaned)
+
+    # strip single leading 0 (e.g. 09811063283 → 9811063283)
+    if re.match(r"^0[6-9]\d{9}$", cleaned):
+        cleaned = cleaned[1:]
+
+    if not IND_PHONE_REGEX.fullmatch(cleaned):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error":            "Invalid Indian phone number.",
+                "input":            value,
+                "reason":           "Must be a valid 10-digit Indian mobile starting with 6, 7, 8, or 9.",
+                "accepted_formats": [
+                    "9811063283",
+                    "+919811063283",
+                    "919811063283",
+                    "09811063283",
+                    "+91 98110 63283",
+                ],
+            },
+        )
+    return cleaned
 def validate_email(value: str) -> str:
     cleaned = value.strip()
     if not EMAIL_REGEX.fullmatch(cleaned):
@@ -190,7 +222,7 @@ def duck_query(sql: str) -> list[dict]:
 @app.get("/search/ind/number", tags=["Search"])
 async def search_by_phone(
     request: Request,
-    q: str = Query(..., min_length=10, max_length=13, example="9811063283"),
+    q: str = Query(..., min_length=10, max_length=15, example="9811063283"),
     _k: dict = Depends(verify_api_key),
 ):
     """Search by primary phone number."""
@@ -235,7 +267,7 @@ async def search_by_email(
 @app.get("/search/ind/alternate", tags=["Search"])
 async def search_by_alternate(
     request: Request,
-    q: str = Query(..., min_length=10, max_length=13, example="9810766029"),
+    q: str = Query(..., min_length=10, max_length=15, example="9810766029"),
     _k: dict = Depends(verify_api_key),
 ):
     """Search by alternate/secondary phone number."""
@@ -254,26 +286,6 @@ async def search_by_alternate(
     return {"query": n, "count": len(results), "results": results}
 
 
-@app.get("/search/ind/name", tags=["Search"])
-async def search_by_name(
-    request: Request,
-    q: str = Query(..., min_length=2, max_length=100, example="Ajay Kumar"),
-    limit: int = Query(20, ge=1, le=50),
-    _k: dict = Depends(verify_api_key),
-):
-    """Search by name (partial match, case-insensitive)."""
-    safe_q = q.replace("'", "''")
-    results = duck_query(f"""
-        SELECT telephone_number, name_of_the_subsciber, date_of_birth,
-               city, state, alternate_phone_no, e_mail_id,
-               connection_type, circle
-        FROM read_parquet('{S3_PATH}')
-        WHERE LOWER(CAST(name_of_the_subsciber AS VARCHAR)) LIKE LOWER('%{safe_q}%')
-        LIMIT {limit}
-    """)
-    if not results:
-        raise HTTPException(404, detail=f"No records found for name: {q}")
-    return {"query": q, "count": len(results), "results": results}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Key info
@@ -354,7 +366,6 @@ async def root():
             "search_by_phone":     "GET /search/ind/number?q=9811063283",
             "search_by_email":     "GET /search/ind/email?q=test@gmail.com",
             "search_by_alternate": "GET /search/ind/alternate?q=9810766029",
-            "search_by_name":      "GET /search/ind/name?q=Ajay",
             "key_info":            "GET /key/info",
             "health":              "GET /health",
         },
