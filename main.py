@@ -225,21 +225,31 @@ async def search_by_phone(
     q: str = Query(..., min_length=10, max_length=15, example="9811063283"),
     _k: dict = Depends(verify_api_key),
 ):
-    """Search by primary phone number."""
+    """Search by primary phone number. Returns customers_db2 shape for frontend."""
     n = validate_ind_phone(q)
-    results = duck_query(f"""
-        SELECT telephone_number, name_of_the_subsciber, date_of_birth,
-               father_s_husband_s_name, address1, address2, address3,
-               city, postal, state, alternate_phone_no, e_mail_id,
+    rows = duck_query(f"""
+        SELECT telephone_number, name_of_the_subsciber AS name, date_of_birth AS dob,
+               father_s_husband_s_name AS father_husband_name,
+               address1, address2, address3, city, postal, state,
+               alternate_phone_no AS alternate_phone, e_mail_id AS email,
                gender, connection_type, service_provider, circle,
                imsi_no, bank_name, bank_a_c_no
         FROM read_parquet('{S3_PATH}')
         WHERE CAST(telephone_number AS VARCHAR) LIKE '%{n[-10:]}'
         LIMIT {MAX_RESULTS}
     """)
-    if not results:
+    if not rows:
         raise HTTPException(404, detail=f"No record found for: {n}")
-    return {"query": n, "count": len(results), "results": results}
+    from phonenumbers import parse as ph_parse, format_number, PhoneNumberFormat, is_valid_number, is_possible_number
+    from phonenumbers import carrier as ph_carrier, geocoder as ph_geo
+    from phonenumbers import timezone as ph_tz, number_type as ph_type
+    phone_meta = get_phone_meta(n)
+    return {
+        "query":         n,
+        "total":         len(rows),
+        "phone_meta":    phone_meta,
+        "customers_db2": {"count": len(rows), "results": rows},
+    }
 
 
 @app.get("/search/ind/email", tags=["Search"])
@@ -248,20 +258,24 @@ async def search_by_email(
     q: str = Query(..., min_length=6, max_length=254, example="test@gmail.com"),
     _k: dict = Depends(verify_api_key),
 ):
-    """Search by email address (case-insensitive)."""
+    """Search by email. Returns customers_db2 shape for frontend."""
     em = validate_email(q)
-    results = duck_query(f"""
-        SELECT telephone_number, name_of_the_subsciber, date_of_birth,
+    rows = duck_query(f"""
+        SELECT telephone_number, name_of_the_subsciber AS name, date_of_birth AS dob,
                address1, address2, city, state,
-               alternate_phone_no, e_mail_id, gender,
-               connection_type, service_provider, circle
+               alternate_phone_no AS alternate_phone, e_mail_id AS email,
+               gender, connection_type, service_provider, circle
         FROM read_parquet('{S3_PATH}')
         WHERE LOWER(CAST(e_mail_id AS VARCHAR)) = '{em}'
         LIMIT {MAX_RESULTS}
     """)
-    if not results:
+    if not rows:
         raise HTTPException(404, detail=f"No record found for: {em}")
-    return {"query": em, "count": len(results), "results": results}
+    return {
+        "query":         em,
+        "total":         len(rows),
+        "customers_db2": {"count": len(rows), "results": rows},
+    }
 
 
 @app.get("/search/ind/alternate", tags=["Search"])
@@ -270,20 +284,26 @@ async def search_by_alternate(
     q: str = Query(..., min_length=10, max_length=15, example="9810766029"),
     _k: dict = Depends(verify_api_key),
 ):
-    """Search by alternate/secondary phone number."""
+    """Search by alternate phone. Returns customers_db2 shape for frontend."""
     n = validate_ind_phone(q)
-    results = duck_query(f"""
-        SELECT telephone_number, name_of_the_subsciber, date_of_birth,
+    rows = duck_query(f"""
+        SELECT telephone_number, name_of_the_subsciber AS name, date_of_birth AS dob,
                address1, address2, city, state,
-               alternate_phone_no, e_mail_id, gender,
-               connection_type, service_provider, circle
+               alternate_phone_no AS alternate_phone, e_mail_id AS email,
+               gender, connection_type, service_provider, circle
         FROM read_parquet('{S3_PATH}')
         WHERE CAST(alternate_phone_no AS VARCHAR) LIKE '%{n[-10:]}'
         LIMIT {MAX_RESULTS}
     """)
-    if not results:
+    if not rows:
         raise HTTPException(404, detail=f"No record found for alternate: {n}")
-    return {"query": n, "count": len(results), "results": results}
+    phone_meta = get_phone_meta(n)
+    return {
+        "query":         n,
+        "total":         len(rows),
+        "phone_meta":    phone_meta,
+        "customers_db2": {"count": len(rows), "results": rows},
+    }
 
 
 
@@ -325,6 +345,11 @@ async def health_head():
 
 @app.get("/health", tags=["Info"])
 async def health():
+    """
+    Returns HealthStats shape matching the frontend interface exactly.
+    India data goes into customer_cluster.customers_db2.
+    main_cluster and email_cluster are zeroed (those are old-API collections).
+    """
     try:
         total = get_duck().execute(
             f"SELECT COUNT(*) FROM read_parquet('{S3_PATH}')"
@@ -339,10 +364,15 @@ async def health():
         kc = get_keys_col()
         return {
             "status": "ok",
-            "database": {
-                "total_records": total,
-                "by_circle": [{"circle": r[0], "count": r[1]} for r in by_circle],
+            # zeroed — these collections live on the old API
+            "main_cluster":  {"address": 0, "pan": 0, "personal": 0},
+            "email_cluster": {"email": 0},
+            # India telecom data goes here → frontend DBCard "CUSTOMER DB2" renders it
+            "customer_cluster": {
+                "customers_db1": 0,
+                "customers_db2": total,
             },
+            "by_circle": [{"circle": r[0], "count": r[1]} for r in by_circle],
             "key_system": {
                 "total_keys":    kc.count_documents({}),
                 "active_keys":   kc.count_documents({"revoked": False}),
