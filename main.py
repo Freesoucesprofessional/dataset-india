@@ -4,6 +4,8 @@ India Subscriber Lookup API — Standalone
 - DuckDB + Cloudflare R2  → data (india-data/data*.parquet)
 - MongoDB keystore DB      → API key validation only
 - Auth: X-API-Key header
+
+FIXED: Phone metadata now returns even when no DB records found
 """
 
 import re
@@ -211,6 +213,7 @@ def validate_ind_phone(value: str) -> str:
             },
         )
     return cleaned
+
 def validate_email(value: str) -> str:
     cleaned = value.strip()
     if not EMAIL_REGEX.fullmatch(cleaned):
@@ -295,8 +298,7 @@ async def search_by_phone(
         WHERE CAST(telephone_number AS VARCHAR) LIKE '%{n[-10:]}'
         LIMIT {MAX_RESULTS}
     """)
-    if not rows:
-        raise HTTPException(404, detail=f"No record found for: {n}")
+    # ✓ FIXED: Always generate phone metadata for phone searches, even when no DB records
     phone_meta = get_phone_meta(n)
     return {
         "query":         n,
@@ -323,8 +325,7 @@ async def search_by_email(
         WHERE LOWER(CAST(e_mail_id AS VARCHAR)) = '{em}'
         LIMIT {MAX_RESULTS}
     """)
-    if not rows:
-        raise HTTPException(404, detail=f"No record found for: {em}")
+    # Email searches don't have phone metadata
     return {
         "query":         em,
         "total":         len(rows),
@@ -349,8 +350,7 @@ async def search_by_alternate(
         WHERE CAST(alternate_phone_no AS VARCHAR) LIKE '%{n[-10:]}'
         LIMIT {MAX_RESULTS}
     """)
-    if not rows:
-        raise HTTPException(404, detail=f"No record found for alternate: {n}")
+    # ✓ FIXED: Always generate phone metadata for phone searches, even when no DB records
     phone_meta = get_phone_meta(n)
     return {
         "query":         n,
