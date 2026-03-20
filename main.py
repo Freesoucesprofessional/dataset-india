@@ -112,28 +112,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS added first so it wraps ALL responses including 401/422/500
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
-    allow_headers=["*"],
-    expose_headers=["*"],
-)
-
-# Force CORS headers on every response — including error responses
-# FastAPI CORSMiddleware sometimes strips headers from non-200 responses
+# ── CORS: handle OPTIONS preflight + inject headers on ALL responses ──
+# Standard CORSMiddleware does not add headers to error (4xx/5xx) responses.
+# This custom middleware handles that correctly.
 @app.middleware("http")
-async def force_cors(request: Request, call_next):
+async def cors_everywhere(request: Request, call_next):
+    # Preflight
     if request.method == "OPTIONS":
-        from fastapi.responses import Response as FR
-        r = FR(status_code=200)
-        r.headers["Access-Control-Allow-Origin"]  = "*"
-        r.headers["Access-Control-Allow-Headers"] = "*"
-        r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
-        return r
-    response = await call_next(request)
+        from starlette.responses import Response as StarResponse
+        res = StarResponse(status_code=200)
+        res.headers["Access-Control-Allow-Origin"]  = "*"
+        res.headers["Access-Control-Allow-Headers"] = "*"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
+        res.headers["Access-Control-Max-Age"]        = "600"
+        return res
+    # All other requests — inject CORS even on 4xx/5xx
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        from starlette.responses import JSONResponse
+        response = JSONResponse({"detail": str(exc)}, status_code=500)
     response.headers["Access-Control-Allow-Origin"]  = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
@@ -220,6 +218,44 @@ def validate_email(value: str) -> str:
     return cleaned.lower()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phone metadata
+# ─────────────────────────────────────────────────────────────────────────────
+
+import phonenumbers
+from phonenumbers import carrier as ph_carrier, geocoder as ph_geo
+from phonenumbers import timezone as ph_tz
+from phonenumbers import number_type as ph_number_type, PhoneNumberType
+
+_PHONE_TYPE_MAP = {
+    PhoneNumberType.MOBILE:               "MOBILE",
+    PhoneNumberType.FIXED_LINE:           "FIXED_LINE",
+    PhoneNumberType.FIXED_LINE_OR_MOBILE: "FIXED_LINE_OR_MOBILE",
+    PhoneNumberType.VOIP:                 "VOIP",
+    PhoneNumberType.TOLL_FREE:            "TOLL_FREE",
+    PhoneNumberType.UNKNOWN:              "UNKNOWN",
+}
+
+def get_phone_meta(raw: str) -> dict:
+    try:
+        number = phonenumbers.parse(f"+91{raw[-10:]}")
+        nt = ph_number_type(number)
+        return {
+            "international_format": phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
+            "national_format":      phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.NATIONAL),
+            "e164_format":          phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164),
+            "country_code":         number.country_code,
+            "is_valid":             phonenumbers.is_valid_number(number),
+            "is_possible":          phonenumbers.is_possible_number(number),
+            "carrier":              ph_carrier.name_for_number(number, "en") or None,
+            "location":             ph_geo.description_for_number(number, "en") or None,
+            "timezones":            list(ph_tz.time_zones_for_number(number)),
+            "number_type":          _PHONE_TYPE_MAP.get(nt, "UNKNOWN"),
+        }
+    except Exception as e:
+        logger.warning("phone_meta failed for %s: %s", raw, e)
+        return {}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DuckDB query helper
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -261,9 +297,6 @@ async def search_by_phone(
     """)
     if not rows:
         raise HTTPException(404, detail=f"No record found for: {n}")
-    from phonenumbers import parse as ph_parse, format_number, PhoneNumberFormat, is_valid_number, is_possible_number
-    from phonenumbers import carrier as ph_carrier, geocoder as ph_geo
-    from phonenumbers import timezone as ph_tz, number_type as ph_type
     phone_meta = get_phone_meta(n)
     return {
         "query":         n,
