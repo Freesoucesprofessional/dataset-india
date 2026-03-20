@@ -1,48 +1,116 @@
 """
-India Subscriber Lookup API — FastAPI + DuckDB + Cloudflare R2
-Searches all data1.parquet, data2.parquet... from india-data bucket
+India Subscriber Lookup API — Standalone
+==========================================
+- DuckDB + Cloudflare R2  → data (india-data/data*.parquet)
+- MongoDB keystore DB      → API key validation only
+- Auth: X-API-Key header
 """
 
+import re
 import os
-import duckdb
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import logging
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-# ─── CONFIG (set these as Environment Variables on Render) ────────────────────
-R2_ENDPOINT   = os.getenv("R2_ENDPOINT")   # https://751eb801a572aef64f2541d813c95e28.r2.cloudflarestorage.com
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+import duckdb
+from fastapi import FastAPI, HTTPException, Depends, Request, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from pymongo.collection import Collection
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-# queries ALL data1.parquet, data2.parquet, data3.parquet... automatically
-S3_PATH = "s3://india-data/data*.parquet"
+load_dotenv()
 
-con = None
+R2_ENDPOINT   = os.getenv("R2_ENDPOINT")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+S3_PATH       = "s3://india-data/data*.parquet"
+
+MONGO_KEY_URL = os.getenv("MONGO_KEY_URL")   # same connection string as old API
+KEY_DB_NAME   = os.getenv("KEY_DB_NAME", "keystore")
+
+MAX_RESULTS   = int(os.getenv("MAX_RESULTS", "10"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DuckDB
+# ─────────────────────────────────────────────────────────────────────────────
+
+duck_con = None
+
+def get_duck():
+    global duck_con
+    if duck_con is None:
+        raise RuntimeError("DuckDB not initialised")
+    return duck_con
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MongoDB — keys only
+# ─────────────────────────────────────────────────────────────────────────────
+
+_key_client: MongoClient | None = None
+
+def get_keys_col() -> Collection:
+    global _key_client
+    if _key_client is None:
+        _key_client = MongoClient(MONGO_KEY_URL, serverSelectionTimeoutMS=5000)
+    return _key_client[KEY_DB_NAME]["keys"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lifespan
+# ─────────────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    global con
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute(f"""
+async def lifespan(app):
+    global duck_con
+
+    duck_con = duckdb.connect()
+    duck_con.execute("INSTALL httpfs; LOAD httpfs;")
+    duck_con.execute(f"""
         SET s3_region='auto';
         SET s3_endpoint='{R2_ENDPOINT.replace("https://", "")}';
         SET s3_access_key_id='{R2_ACCESS_KEY}';
         SET s3_secret_access_key='{R2_SECRET_KEY}';
         SET s3_url_style='path';
     """)
-    print("DuckDB connected to india-data bucket ✓")
+    logger.info("✓ DuckDB → R2 india-data/data*.parquet")
+
+    try:
+        col = get_keys_col()
+        col.database.client.admin.command("ping")
+        logger.info("✓ MongoDB keystore — %s keys", col.count_documents({}))
+    except Exception as e:
+        logger.error("✗ MongoDB: %s", e)
+
     yield
-    con.close()
+
+    if duck_con:
+        duck_con.close()
+    if _key_client:
+        _key_client.close()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# App
+# ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="India Subscriber Lookup API",
-    description="Search Indian telecom subscriber records by phone, alternate phone, email, or name.",
+    title="India Subscriber API",
     version="1.0.0",
-    lifespan=lifespan
+    docs_url=None,
+    redoc_url=None,
+    lifespan=lifespan,
 )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,141 +118,244 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def row_to_dict(row, columns):
-    return {col: (str(val) if val is not None else None) for col, val in zip(columns, row)}
+# ─────────────────────────────────────────────────────────────────────────────
+# Auth — X-API-Key
+# ─────────────────────────────────────────────────────────────────────────────
 
+def verify_api_key(request: Request) -> dict:
+    raw = request.headers.get("X-API-Key", "").strip()
+    if not raw:
+        raise HTTPException(status_code=401, detail="Missing X-API-Key header.")
 
-# ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
-@app.get("/", tags=["Health"])
-def root():
-    return {"status": "ok", "message": "India Subscriber API is running"}
+    col = get_keys_col()
+    doc = col.find_one({"key": raw})
+    if not doc:
+        raise HTTPException(status_code=401, detail="Invalid API key.")
+    if doc.get("revoked"):
+        raise HTTPException(status_code=401, detail="API key has been revoked.")
 
+    expiry = doc.get("expires_at")
+    if expiry and datetime.now(timezone.utc) >= datetime.fromisoformat(expiry):
+        raise HTTPException(status_code=401, detail="API key has expired.")
 
-# ─── SEARCH BY PHONE ──────────────────────────────────────────────────────────
-@app.get("/search/phone", tags=["Search"])
-def search_by_phone(
-    number: str = Query(..., description="Primary telephone number", example="9811063283")
-):
-    """Search subscriber by primary telephone number."""
+    # track usage
+    col.update_one(
+        {"key": raw},
+        {"$inc": {"usage_count": 1},
+         "$set": {"last_used": datetime.now(timezone.utc).isoformat()}},
+    )
+    return doc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+IND_PHONE_REGEX = re.compile(r"^[6-9]\d{9}$")
+EMAIL_REGEX     = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
+def validate_ind_phone(value: str) -> str:
+    cleaned = re.sub(r"[\s\-\(\)\+]", "", value.strip())
+    cleaned = re.sub(r"^(91)(?=[6-9])", "", cleaned)
+    if not IND_PHONE_REGEX.fullmatch(cleaned):
+        raise HTTPException(422, detail="Invalid Indian phone number. Expected 10 digits starting with 6–9.")
+    return cleaned
+
+def validate_email(value: str) -> str:
+    cleaned = value.strip()
+    if not EMAIL_REGEX.fullmatch(cleaned):
+        raise HTTPException(422, detail=f"'{value}' is not a valid email address.")
+    return cleaned.lower()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DuckDB query helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+def duck_query(sql: str) -> list[dict]:
     try:
-        result = con.execute(f"""
-            SELECT telephone_number, name_of_the_subsciber, date_of_birth,
-                   father_s_husband_s_name, address1, address2, address3,
-                   city, postal, state, alternate_phone_no, e_mail_id,
-                   gender, connection_type, service_provider, circle,
-                   imsi_no, bank_name, bank_a_c_no
-            FROM read_parquet('{S3_PATH}')
-            WHERE CAST(telephone_number AS VARCHAR) = '{number}'
-            LIMIT 5
-        """).fetchall()
-        cols = ["telephone_number","name","dob","father_husband_name",
-                "address1","address2","address3","city","postal","state",
-                "alternate_phone","email","gender","connection_type",
-                "service_provider","circle","imsi","bank_name","bank_ac"]
-        if not result:
-            raise HTTPException(status_code=404, detail=f"No record found for number: {number}")
-        return {"count": len(result), "results": [row_to_dict(r, cols) for r in result]}
-    except HTTPException:
-        raise
+        rel  = get_duck().execute(sql)
+        cols = [d[0] for d in rel.description]
+        return [
+            {col: (str(val) if val is not None else None)
+             for col, val in zip(cols, row)}
+            for row in rel.fetchall()
+        ]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("DuckDB error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Query error: {str(e)}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Search endpoints
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── SEARCH BY EMAIL ──────────────────────────────────────────────────────────
-@app.get("/search/email", tags=["Search"])
-def search_by_email(
-    email: str = Query(..., description="Email address", example="test@gmail.com")
+@app.get("/search/ind/number", tags=["Search"])
+async def search_by_phone(
+    request: Request,
+    q: str = Query(..., min_length=10, max_length=13, example="9811063283"),
+    _k: dict = Depends(verify_api_key),
 ):
-    """Search subscriber by email (case-insensitive)."""
-    try:
-        result = con.execute(f"""
-            SELECT telephone_number, name_of_the_subsciber, date_of_birth,
-                   address1, address2, city, state,
-                   alternate_phone_no, e_mail_id, gender,
-                   connection_type, service_provider, circle
-            FROM read_parquet('{S3_PATH}')
-            WHERE LOWER(CAST(e_mail_id AS VARCHAR)) = LOWER('{email}')
-            LIMIT 10
-        """).fetchall()
-        cols = ["telephone_number","name","dob","address1","address2","city","state",
-                "alternate_phone","email","gender","connection_type","service_provider","circle"]
-        if not result:
-            raise HTTPException(status_code=404, detail=f"No record found for email: {email}")
-        return {"count": len(result), "results": [row_to_dict(r, cols) for r in result]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Search by primary phone number."""
+    n = validate_ind_phone(q)
+    results = duck_query(f"""
+        SELECT telephone_number, name_of_the_subsciber, date_of_birth,
+               father_s_husband_s_name, address1, address2, address3,
+               city, postal, state, alternate_phone_no, e_mail_id,
+               gender, connection_type, service_provider, circle,
+               imsi_no, bank_name, bank_a_c_no
+        FROM read_parquet('{S3_PATH}')
+        WHERE CAST(telephone_number AS VARCHAR) LIKE '%{n[-10:]}'
+        LIMIT {MAX_RESULTS}
+    """)
+    if not results:
+        raise HTTPException(404, detail=f"No record found for: {n}")
+    return {"query": n, "count": len(results), "results": results}
 
 
-# ─── SEARCH BY ALTERNATE PHONE ────────────────────────────────────────────────
-@app.get("/search/alternate", tags=["Search"])
-def search_by_alternate(
-    number: str = Query(..., description="Alternate phone number", example="9810766029")
+@app.get("/search/ind/email", tags=["Search"])
+async def search_by_email(
+    request: Request,
+    q: str = Query(..., min_length=6, max_length=254, example="test@gmail.com"),
+    _k: dict = Depends(verify_api_key),
 ):
-    """Search subscriber by alternate/secondary phone number."""
-    try:
-        result = con.execute(f"""
-            SELECT telephone_number, name_of_the_subsciber, date_of_birth,
-                   address1, address2, city, state,
-                   alternate_phone_no, e_mail_id, gender,
-                   connection_type, service_provider, circle
-            FROM read_parquet('{S3_PATH}')
-            WHERE CAST(alternate_phone_no AS VARCHAR) = '{number}'
-            LIMIT 10
-        """).fetchall()
-        cols = ["telephone_number","name","dob","address1","address2","city","state",
-                "alternate_phone","email","gender","connection_type","service_provider","circle"]
-        if not result:
-            raise HTTPException(status_code=404, detail=f"No record found for alternate: {number}")
-        return {"count": len(result), "results": [row_to_dict(r, cols) for r in result]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Search by email address (case-insensitive)."""
+    em = validate_email(q)
+    results = duck_query(f"""
+        SELECT telephone_number, name_of_the_subsciber, date_of_birth,
+               address1, address2, city, state,
+               alternate_phone_no, e_mail_id, gender,
+               connection_type, service_provider, circle
+        FROM read_parquet('{S3_PATH}')
+        WHERE LOWER(CAST(e_mail_id AS VARCHAR)) = '{em}'
+        LIMIT {MAX_RESULTS}
+    """)
+    if not results:
+        raise HTTPException(404, detail=f"No record found for: {em}")
+    return {"query": em, "count": len(results), "results": results}
 
 
-# ─── SEARCH BY NAME ───────────────────────────────────────────────────────────
-@app.get("/search/name", tags=["Search"])
-def search_by_name(
-    name:  str = Query(..., description="Subscriber name (partial match)", example="Ajay"),
-    limit: int = Query(20, ge=1, le=100)
+@app.get("/search/ind/alternate", tags=["Search"])
+async def search_by_alternate(
+    request: Request,
+    q: str = Query(..., min_length=10, max_length=13, example="9810766029"),
+    _k: dict = Depends(verify_api_key),
 ):
-    """Search subscriber by name (partial, case-insensitive)."""
-    try:
-        result = con.execute(f"""
-            SELECT telephone_number, name_of_the_subsciber, date_of_birth,
-                   city, state, alternate_phone_no, e_mail_id,
-                   connection_type, circle
-            FROM read_parquet('{S3_PATH}')
-            WHERE LOWER(CAST(name_of_the_subsciber AS VARCHAR)) LIKE LOWER('%{name}%')
-            LIMIT {limit}
-        """).fetchall()
-        cols = ["telephone_number","name","dob","city","state",
-                "alternate_phone","email","connection_type","circle"]
-        if not result:
-            raise HTTPException(status_code=404, detail=f"No records found for name: {name}")
-        return {"count": len(result), "results": [row_to_dict(r, cols) for r in result]}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Search by alternate/secondary phone number."""
+    n = validate_ind_phone(q)
+    results = duck_query(f"""
+        SELECT telephone_number, name_of_the_subsciber, date_of_birth,
+               address1, address2, city, state,
+               alternate_phone_no, e_mail_id, gender,
+               connection_type, service_provider, circle
+        FROM read_parquet('{S3_PATH}')
+        WHERE CAST(alternate_phone_no AS VARCHAR) LIKE '%{n[-10:]}'
+        LIMIT {MAX_RESULTS}
+    """)
+    if not results:
+        raise HTTPException(404, detail=f"No record found for alternate: {n}")
+    return {"query": n, "count": len(results), "results": results}
 
 
-# ─── STATS ────────────────────────────────────────────────────────────────────
-@app.get("/stats", tags=["Info"])
-def get_stats():
-    """Total records + breakdown by circle."""
+@app.get("/search/ind/name", tags=["Search"])
+async def search_by_name(
+    request: Request,
+    q: str = Query(..., min_length=2, max_length=100, example="Ajay Kumar"),
+    limit: int = Query(20, ge=1, le=50),
+    _k: dict = Depends(verify_api_key),
+):
+    """Search by name (partial match, case-insensitive)."""
+    safe_q = q.replace("'", "''")
+    results = duck_query(f"""
+        SELECT telephone_number, name_of_the_subsciber, date_of_birth,
+               city, state, alternate_phone_no, e_mail_id,
+               connection_type, circle
+        FROM read_parquet('{S3_PATH}')
+        WHERE LOWER(CAST(name_of_the_subsciber AS VARCHAR)) LIKE LOWER('%{safe_q}%')
+        LIMIT {limit}
+    """)
+    if not results:
+        raise HTTPException(404, detail=f"No records found for name: {q}")
+    return {"query": q, "count": len(results), "results": results}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Key info
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/key/info", tags=["Key"])
+async def key_info(key_doc: dict = Depends(verify_api_key)):
+    """Check your API key status, expiry and usage."""
+    expiry = key_doc.get("expires_at")
+    now    = datetime.now(timezone.utc)
+    if expiry:
+        exp_dt      = datetime.fromisoformat(expiry)
+        days_left   = max(0, (exp_dt - now).days)
+        expires_str = exp_dt.strftime("%Y-%m-%d %H:%M UTC")
+    else:
+        days_left, expires_str = None, "Never (lifetime)"
+    return {
+        "key":         key_doc["key"],
+        "type":        key_doc.get("type", "unknown"),
+        "label":       key_doc.get("label", ""),
+        "active":      True,
+        "expires_at":  expires_str,
+        "days_left":   days_left,
+        "usage_count": key_doc.get("usage_count", 0),
+        "last_used":   key_doc.get("last_used", "never"),
+        "created_at":  key_doc.get("created_at", ""),
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Health & stats (public)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.head("/health")
+async def health_head():
+    return JSONResponse(content=None, status_code=200)
+
+
+@app.get("/health", tags=["Info"])
+async def health():
     try:
-        total = con.execute(f"SELECT COUNT(*) FROM read_parquet('{S3_PATH}')").fetchone()[0]
-        by_circle = con.execute(f"""
-            SELECT circle, COUNT(*) as count
+        total = get_duck().execute(
+            f"SELECT COUNT(*) FROM read_parquet('{S3_PATH}')"
+        ).fetchone()[0]
+
+        by_circle = get_duck().execute(f"""
+            SELECT circle, COUNT(*) as cnt
             FROM read_parquet('{S3_PATH}')
-            GROUP BY circle ORDER BY count DESC LIMIT 20
+            GROUP BY circle ORDER BY cnt DESC LIMIT 10
         """).fetchall()
+
+        kc = get_keys_col()
         return {
-            "total_records": total,
-            "by_circle": [{"circle": r[0], "count": r[1]} for r in by_circle]
+            "status": "ok",
+            "database": {
+                "total_records": total,
+                "by_circle": [{"circle": r[0], "count": r[1]} for r in by_circle],
+            },
+            "key_system": {
+                "total_keys":    kc.count_documents({}),
+                "active_keys":   kc.count_documents({"revoked": False}),
+                "revoked_keys":  kc.count_documents({"revoked": True}),
+                "monthly_keys":  kc.count_documents({"type": "monthly"}),
+                "yearly_keys":   kc.count_documents({"type": "yearly"}),
+                "lifetime_keys": kc.count_documents({"type": "lifetime"}),
+            },
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "error", "detail": str(e)}
+
+
+@app.get("/", tags=["Info"])
+async def root():
+    return {
+        "api":     "India Subscriber Lookup API",
+        "version": "1.0.0",
+        "status":  "ok",
+        "endpoints": {
+            "search_by_phone":     "GET /search/ind/number?q=9811063283",
+            "search_by_email":     "GET /search/ind/email?q=test@gmail.com",
+            "search_by_alternate": "GET /search/ind/alternate?q=9810766029",
+            "search_by_name":      "GET /search/ind/name?q=Ajay",
+            "key_info":            "GET /key/info",
+            "health":              "GET /health",
+        },
+    }
