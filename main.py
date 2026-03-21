@@ -57,7 +57,7 @@ MONGO_URL     = os.getenv("MONGO_KEY_URL", "")
 KEY_DB        = os.getenv("KEY_DB_NAME", "keystore")
 MAX_RESULTS   = int(os.getenv("MAX_RESULTS", "10"))
 
-# total rows in your database (22.17 Crore)
+# total rows in your database (10.19 Crore)
 # used as fallback if DuckDB COUNT(*) is slow
 KNOWN_TOTAL   = 101_879_689
 
@@ -226,25 +226,52 @@ def phone_meta(n: str) -> dict:
 
 
 # ── DuckDB query ──────────────────────────────────────────────────────────────
+
+# Column names that contain a person's name (used to set lowercase "name" key
+# so RecordCard in frontend can display it in the card header)
+_NAME_COLS = {
+    "name", "customer name", "name_of_the_subsciber", "cust_name",
+    "first name", "firstname", "full name", "fullname", "ccfname",
+    "person first name", "customeclass", "cname",
+}
+
 def run_query(sql: str) -> list[dict]:
-    """Execute SQL, return list of clean dicts (no None/nan values)."""
+    """
+    Execute SQL, return list of clean dicts.
+    - Strips None/nan values
+    - Hides internal columns (_mobile, _alt_mobile, _email)
+    - Renames _source → _source_file
+    - Adds lowercase 'name' key so RecordCard header shows the person's name
+    """
     try:
         rel  = duck().execute(sql)
         cols = [d[0] for d in rel.description]
         rows = []
         for row in rel.fetchall():
             r = {}
+            name_found = False
+
             for col, val in zip(cols, row):
-                # skip internal search columns — don't expose to frontend
-                if col in ("_mobile", "_alt_mobile", "_email"):
+                # hide internal search + system columns
+                if col in ("_mobile", "_alt_mobile", "_email", "filename"):
                     continue
-                # clean up empty/null values
+
+                # clean empty/null
                 if val is None:
                     continue
                 s = str(val).strip()
                 if s.lower() in ("", "nan", "none", "null"):
                     continue
-                r[col] = s
+
+                # rename _source → _source_file for cleaner frontend display
+                display_col = "_source_file" if col == "_source" else col
+                r[display_col] = s
+
+                # add lowercase "name" key — RecordCard uses record.name for header
+                if not name_found and col.strip().lower() in _NAME_COLS:
+                    r["name"] = s
+                    name_found = True
+
             if r:
                 rows.append(r)
         return rows
@@ -267,7 +294,7 @@ async def by_number(
     """
     n    = clean_mobile(q)
     rows = run_query(f"""
-        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true, filename=true)
+        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true)
         WHERE _mobile = '{n}'
         LIMIT {MAX_RESULTS}
     """)
@@ -294,7 +321,7 @@ async def by_email(
     """
     em   = clean_email(q)
     rows = run_query(f"""
-        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true, filename=true)
+        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true)
         WHERE _email = '{em}'
         LIMIT {MAX_RESULTS}
     """)
@@ -320,7 +347,7 @@ async def by_alternate(
     """
     n    = clean_mobile(q)
     rows = run_query(f"""
-        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true, filename=true)
+        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true)
         WHERE _alt_mobile = '{n}'
         LIMIT {MAX_RESULTS}
     """)
@@ -378,7 +405,7 @@ async def health():
     try:
         # use known total as fast response — avoids slow COUNT(*) on 22 Cr rows
         # uncomment the line below if you want live count (slower):
-        # total = duck().execute(f"SELECT COUNT(*) FROM read_parquet('{S3_PATH}', union_by_name=true, filename=true)").fetchone()[0]
+        # total = duck().execute(f"SELECT COUNT(*) FROM read_parquet('{S3_PATH}', union_by_name=true)").fetchone()[0]
         total = KNOWN_TOTAL
 
         kc = keys_col()
@@ -387,11 +414,15 @@ async def health():
             # zeroed — old API owns these collections
             "main_cluster":  {"address": 0, "pan": 0, "personal": 0},
             "email_cluster": {"email": 0},
-            # this is what frontend renders as "CUSTOMER DB2"
+            # frontend renders this as CUSTOMER DB2 card
             "customer_cluster": {
                 "customers_db1": 0,
-                "customers_db2": total,   # 22,17,00,000
+                "customers_db2": total,   # 10.19 Crore = 101,879,689
             },
+            # by_circle — DatabasePage uses this for circle breakdown
+            # our parquet files use 'State' not 'circle' column
+            # so we return empty — old API provides this if needed
+            "by_circle": [],
             "key_system": {
                 "total_keys":    kc.count_documents({}),
                 "active_keys":   kc.count_documents({"revoked": False}),
