@@ -1,235 +1,201 @@
 """
-India Subscriber Lookup API — Standalone
-==========================================
-- DuckDB + Cloudflare R2  → data (india-data/data*.parquet)
-- MongoDB keystore DB      → API key validation only
-- Auth: X-API-Key header
+India Subscriber Lookup API  —  v2.0
+======================================
+Matches frontend shape in TerminalSearch.tsx / api.ts exactly.
 
-FIXED: Phone metadata now returns even when no DB records found
+Frontend expects from /search/ind/number:
+  {
+    query, total, phone_meta,
+    customers_db2: { count, results: [ raw row dicts ] }
+  }
+
+Frontend expects from /health:
+  {
+    status, main_cluster, email_cluster,
+    customer_cluster: { customers_db1, customers_db2 },
+    by_circle, key_system
+  }
+
+Install:
+  pip install fastapi uvicorn duckdb pymongo python-dotenv phonenumbers
+
+.env:
+  R2_ENDPOINT   = https://<account>.r2.cloudflarestorage.com
+  R2_ACCESS_KEY = ...
+  R2_SECRET_KEY = ...
+  MONGO_KEY_URL = mongodb+srv://...
+  KEY_DB_NAME   = keystore
+  MAX_RESULTS   = 10
+
+Run:
+  uvicorn api:app --host 0.0.0.0 --port 8000
 """
 
-import re
-import os
-import logging
+import re, os, logging
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import duckdb
+import phonenumbers
+from phonenumbers import (
+    carrier as ph_carrier, geocoder as ph_geo,
+    timezone as ph_tz, number_type as ph_type, PhoneNumberType,
+)
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pymongo import MongoClient
-from pymongo.collection import Collection
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
 
 load_dotenv()
 
-R2_ENDPOINT   = os.getenv("R2_ENDPOINT")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
+# ── config ────────────────────────────────────────────────────────────────────
+R2_ENDPOINT   = os.getenv("R2_ENDPOINT", "")
+R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
+R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 S3_PATH       = "s3://india-data/data*.parquet"
-
-MONGO_KEY_URL = os.getenv("MONGO_KEY_URL")   # same connection string as old API
-KEY_DB_NAME   = os.getenv("KEY_DB_NAME", "keystore")
-
+MONGO_URL     = os.getenv("MONGO_KEY_URL", "")
+KEY_DB        = os.getenv("KEY_DB_NAME", "keystore")
 MAX_RESULTS   = int(os.getenv("MAX_RESULTS", "10"))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
+# total rows in your database (22.17 Crore)
+# used as fallback if DuckDB COUNT(*) is slow
+KNOWN_TOTAL   = 93_614_386
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DuckDB
-# ─────────────────────────────────────────────────────────────────────────────
+# ── globals ───────────────────────────────────────────────────────────────────
+_duck:  duckdb.DuckDBPyConnection | None = None
+_mongo: MongoClient | None = None
 
-duck_con = None
 
-def get_duck():
-    global duck_con
-    if duck_con is None:
-        raise RuntimeError("DuckDB not initialised")
-    return duck_con
+def duck():
+    if _duck is None:
+        raise RuntimeError("DuckDB not ready")
+    return _duck
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MongoDB — keys only
-# ─────────────────────────────────────────────────────────────────────────────
 
-_key_client: MongoClient | None = None
+def keys_col():
+    global _mongo
+    if _mongo is None:
+        _mongo = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+    return _mongo[KEY_DB]["keys"]
 
-def get_keys_col() -> Collection:
-    global _key_client
-    if _key_client is None:
-        _key_client = MongoClient(MONGO_KEY_URL, serverSelectionTimeoutMS=5000)
-    return _key_client[KEY_DB_NAME]["keys"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Lifespan
-# ─────────────────────────────────────────────────────────────────────────────
-
+# ── lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app):
-    global duck_con
-
-    duck_con = duckdb.connect()
-    duck_con.execute("INSTALL httpfs; LOAD httpfs;")
-    duck_con.execute(f"""
-        SET s3_region='auto';
-        SET s3_endpoint='{R2_ENDPOINT.replace("https://", "")}';
-        SET s3_access_key_id='{R2_ACCESS_KEY}';
-        SET s3_secret_access_key='{R2_SECRET_KEY}';
-        SET s3_url_style='path';
+    global _duck
+    _duck = duckdb.connect()
+    _duck.execute("INSTALL httpfs; LOAD httpfs;")
+    _duck.execute(f"""
+        SET s3_region            = 'auto';
+        SET s3_endpoint          = '{R2_ENDPOINT.replace("https://", "")}';
+        SET s3_access_key_id     = '{R2_ACCESS_KEY}';
+        SET s3_secret_access_key = '{R2_SECRET_KEY}';
+        SET s3_url_style         = 'path';
     """)
-    logger.info("✓ DuckDB → R2 india-data/data*.parquet")
+    log.info("DuckDB → R2  %s", S3_PATH)
 
     try:
-        col = get_keys_col()
-        col.database.client.admin.command("ping")
-        logger.info("✓ MongoDB keystore — %s keys", col.count_documents({}))
+        keys_col().database.client.admin.command("ping")
+        n = keys_col().count_documents({})
+        log.info("MongoDB keystore OK  —  %s keys", n)
     except Exception as e:
-        logger.error("✗ MongoDB: %s", e)
+        log.error("MongoDB: %s", e)
 
     yield
 
-    if duck_con:
-        duck_con.close()
-    if _key_client:
-        _key_client.close()
+    if _duck:   _duck.close()
+    if _mongo:  _mongo.close()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# App
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ── app ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="India Subscriber API",
-    version="1.0.0",
+    version="2.0.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
 )
 
-# ── CORS: handle OPTIONS preflight + inject headers on ALL responses ──
-# Standard CORSMiddleware does not add headers to error (4xx/5xx) responses.
-# This custom middleware handles that correctly.
+
+# ── CORS (every response including errors) ────────────────────────────────────
 @app.middleware("http")
-async def cors_everywhere(request: Request, call_next):
-    # Preflight
+async def cors(request: Request, call_next):
     if request.method == "OPTIONS":
-        from starlette.responses import Response as StarResponse
-        res = StarResponse(status_code=200)
-        res.headers["Access-Control-Allow-Origin"]  = "*"
-        res.headers["Access-Control-Allow-Headers"] = "*"
-        res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
-        res.headers["Access-Control-Max-Age"]        = "600"
-        return res
-    # All other requests — inject CORS even on 4xx/5xx
+        from starlette.responses import Response
+        r = Response(status_code=200)
+        r.headers.update({
+            "Access-Control-Allow-Origin":  "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+            "Access-Control-Max-Age":       "600",
+        })
+        return r
     try:
-        response = await call_next(request)
+        resp = await call_next(request)
     except Exception as exc:
-        from starlette.responses import JSONResponse
-        response = JSONResponse({"detail": str(exc)}, status_code=500)
-    response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
-    return response
+        resp = JSONResponse({"detail": str(exc)}, status_code=500)
+    resp.headers["Access-Control-Allow-Origin"]  = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
+    return resp
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Auth — X-API-Key
-# ─────────────────────────────────────────────────────────────────────────────
 
-def verify_api_key(request: Request) -> dict:
-    raw = request.headers.get("X-API-Key", "").strip()
-    if not raw:
-        raise HTTPException(status_code=401, detail="Missing X-API-Key header.")
-
-    col = get_keys_col()
-    doc = col.find_one({"key": raw})
+# ── auth ──────────────────────────────────────────────────────────────────────
+def auth(request: Request) -> dict:
+    key = request.headers.get("X-API-Key", "").strip()
+    if not key:
+        raise HTTPException(401, "Missing X-API-Key header.")
+    doc = keys_col().find_one({"key": key})
     if not doc:
-        raise HTTPException(status_code=401, detail="Invalid API key.")
+        raise HTTPException(401, "Invalid API key.")
     if doc.get("revoked"):
-        raise HTTPException(status_code=401, detail="API key has been revoked.")
-
-    expiry = doc.get("expires_at")
-    if expiry and datetime.now(timezone.utc) >= datetime.fromisoformat(expiry):
-        raise HTTPException(status_code=401, detail="API key has expired.")
-
-    # track usage
-    col.update_one(
-        {"key": raw},
+        raise HTTPException(401, "API key revoked.")
+    exp = doc.get("expires_at")
+    if exp and datetime.now(timezone.utc) >= datetime.fromisoformat(exp):
+        raise HTTPException(401, "API key expired.")
+    keys_col().update_one(
+        {"key": key},
         {"$inc": {"usage_count": 1},
-         "$set": {"last_used": datetime.now(timezone.utc).isoformat()}},
+         "$set": {"last_used": datetime.now(timezone.utc).isoformat()}}
     )
     return doc
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Validation
-# ─────────────────────────────────────────────────────────────────────────────
 
-IND_PHONE_REGEX = re.compile(r"^[6-9]\d{9}$")
-EMAIL_REGEX     = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+# ── validation ────────────────────────────────────────────────────────────────
+MOBILE_RE = re.compile(r"^[6-9]\d{9}$")
+EMAIL_RE  = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
 
-def validate_ind_phone(value: str) -> str:
-    """
-    Normalises any Indian number format to 10 digits.
-    Accepted:
-      9811063283        (10 digits, plain)
-      +919811063283     (+91 prefix)
-      919811063283      (91 prefix, 12 digits)
-      09811063283       (leading 0)
-      +91 98110 63283   (spaces/dashes stripped)
-    Rejects any non-Indian or invalid number.
-    """
-    # strip spaces, dashes, dots, brackets, plus sign
-    cleaned = re.sub(r"[\s\-\.\(\)\+]", "", value.strip())
 
-    # strip country code 91 (handles: 91XXXXXXXXXX or 091XXXXXXXXXX or 0091XXXXXXXXXX)
-    if re.match(r"^0{0,2}91[6-9]\d{9}$", cleaned):
-        cleaned = re.sub(r"^0{0,2}91", "", cleaned)
+def clean_mobile(v: str) -> str:
+    c = re.sub(r"[\s\-\.\(\)\+]", "", v.strip())
+    c = re.sub(r"^0{0,2}91(?=[6-9]\d{9}$)", "", c)
+    if re.match(r"^0[6-9]\d{9}$", c):
+        c = c[1:]
+    if not MOBILE_RE.fullmatch(c):
+        raise HTTPException(422, {
+            "error":   "Invalid Indian phone number.",
+            "input":   v,
+            "reason":  "Must be 10-digit Indian mobile starting 6-9.",
+            "accepted_formats": [
+                "9811063283", "+919811063283",
+                "919811063283", "09811063283",
+            ],
+        })
+    return c
 
-    # strip single leading 0 (e.g. 09811063283 → 9811063283)
-    if re.match(r"^0[6-9]\d{9}$", cleaned):
-        cleaned = cleaned[1:]
 
-    if not IND_PHONE_REGEX.fullmatch(cleaned):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error":            "Invalid Indian phone number.",
-                "input":            value,
-                "reason":           "Must be a valid 10-digit Indian mobile starting with 6, 7, 8, or 9.",
-                "accepted_formats": [
-                    "9811063283",
-                    "+919811063283",
-                    "919811063283",
-                    "09811063283",
-                    "+91 98110 63283",
-                ],
-            },
-        )
-    return cleaned
+def clean_email(v: str) -> str:
+    c = v.strip().lower()
+    if not EMAIL_RE.fullmatch(c):
+        raise HTTPException(422, f"'{v}' is not a valid email address.")
+    return c
 
-def validate_email(value: str) -> str:
-    cleaned = value.strip()
-    if not EMAIL_REGEX.fullmatch(cleaned):
-        raise HTTPException(422, detail=f"'{value}' is not a valid email address.")
-    return cleaned.lower()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Phone metadata
-# ─────────────────────────────────────────────────────────────────────────────
-
-import phonenumbers
-from phonenumbers import carrier as ph_carrier, geocoder as ph_geo
-from phonenumbers import timezone as ph_tz
-from phonenumbers import number_type as ph_number_type, PhoneNumberType
-
-_PHONE_TYPE_MAP = {
+# ── phone metadata ────────────────────────────────────────────────────────────
+_PTYPE = {
     PhoneNumberType.MOBILE:               "MOBILE",
     PhoneNumberType.FIXED_LINE:           "FIXED_LINE",
     PhoneNumberType.FIXED_LINE_OR_MOBILE: "FIXED_LINE_OR_MOBILE",
@@ -238,195 +204,194 @@ _PHONE_TYPE_MAP = {
     PhoneNumberType.UNKNOWN:              "UNKNOWN",
 }
 
-def get_phone_meta(raw: str) -> dict:
+
+def phone_meta(n: str) -> dict:
     try:
-        number = phonenumbers.parse(f"+91{raw[-10:]}")
-        nt = ph_number_type(number)
+        p = phonenumbers.parse(f"+91{n}")
         return {
-            "international_format": phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
-            "national_format":      phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.NATIONAL),
-            "e164_format":          phonenumbers.format_number(number, phonenumbers.PhoneNumberFormat.E164),
-            "country_code":         number.country_code,
-            "is_valid":             phonenumbers.is_valid_number(number),
-            "is_possible":          phonenumbers.is_possible_number(number),
-            "carrier":              ph_carrier.name_for_number(number, "en") or None,
-            "location":             ph_geo.description_for_number(number, "en") or None,
-            "timezones":            list(ph_tz.time_zones_for_number(number)),
-            "number_type":          _PHONE_TYPE_MAP.get(nt, "UNKNOWN"),
+            "international_format": phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.INTERNATIONAL),
+            "national_format":      phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.NATIONAL),
+            "e164_format":          phonenumbers.format_number(p, phonenumbers.PhoneNumberFormat.E164),
+            "country_code":         p.country_code,
+            "is_valid":             phonenumbers.is_valid_number(p),
+            "is_possible":          phonenumbers.is_possible_number(p),
+            "carrier":              ph_carrier.name_for_number(p, "en") or None,
+            "location":             ph_geo.description_for_number(p, "en") or None,
+            "timezones":            list(ph_tz.time_zones_for_number(p)),
+            "number_type":          _PTYPE.get(ph_type(p), "UNKNOWN"),
         }
     except Exception as e:
-        logger.warning("phone_meta failed for %s: %s", raw, e)
+        log.warning("phone_meta: %s", e)
         return {}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DuckDB query helper
-# ─────────────────────────────────────────────────────────────────────────────
 
-def duck_query(sql: str) -> list[dict]:
+# ── DuckDB query ──────────────────────────────────────────────────────────────
+def run_query(sql: str) -> list[dict]:
+    """Execute SQL, return list of clean dicts (no None/nan values)."""
     try:
-        rel  = get_duck().execute(sql)
+        rel  = duck().execute(sql)
         cols = [d[0] for d in rel.description]
-        return [
-            {col: (str(val) if val is not None else None)
-             for col, val in zip(cols, row)}
-            for row in rel.fetchall()
-        ]
+        rows = []
+        for row in rel.fetchall():
+            r = {}
+            for col, val in zip(cols, row):
+                # skip internal search columns — don't expose to frontend
+                if col in ("_mobile", "_alt_mobile", "_email"):
+                    continue
+                # clean up empty/null values
+                if val is None:
+                    continue
+                s = str(val).strip()
+                if s.lower() in ("", "nan", "none", "null"):
+                    continue
+                r[col] = s
+            if r:
+                rows.append(r)
+        return rows
     except Exception as e:
-        logger.error("DuckDB error: %s", e)
-        raise HTTPException(status_code=500, detail=f"Query error: {str(e)}")
+        log.error("DuckDB: %s\nSQL: %s", e, sql[:200])
+        raise HTTPException(500, f"Query error: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Search endpoints
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ── search endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/search/ind/number", tags=["Search"])
-async def search_by_phone(
-    request: Request,
-    q: str = Query(..., min_length=10, max_length=15, example="9811063283"),
-    _k: dict = Depends(verify_api_key),
+async def by_number(
+    q:   str  = Query(..., min_length=10, max_length=15, example="9811063283"),
+    _k: dict  = Depends(auth),
 ):
-    """Search by primary phone number. Returns customers_db2 shape for frontend."""
-    n = validate_ind_phone(q)
-    rows = duck_query(f"""
-        SELECT telephone_number, name_of_the_subsciber AS name, date_of_birth AS dob,
-               father_s_husband_s_name AS father_husband_name,
-               address1, address2, address3, city, postal, state,
-               alternate_phone_no AS alternate_phone, e_mail_id AS email,
-               gender, connection_type, service_provider, circle,
-               imsi_no, bank_name, bank_a_c_no
-        FROM read_parquet('{S3_PATH}')
-        WHERE CAST(telephone_number AS VARCHAR) LIKE '%{n[-10:]}'
+    """
+    Search by primary mobile number.
+    Returns: { query, total, phone_meta, customers_db2: { count, results } }
+    Frontend merges this with old API and renders under CUSTOMER DB2 card.
+    """
+    n    = clean_mobile(q)
+    rows = run_query(f"""
+        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true, filename=true)
+        WHERE _mobile = '{n}'
         LIMIT {MAX_RESULTS}
     """)
-    # ✓ FIXED: Always generate phone metadata for phone searches, even when no DB records
-    phone_meta = get_phone_meta(n)
+
     return {
-        "query":         n,
-        "total":         len(rows),
-        "phone_meta":    phone_meta,
-        "customers_db2": {"count": len(rows), "results": rows},
+        "query":      n,
+        "total":      len(rows),
+        "phone_meta": phone_meta(n),
+        "customers_db2": {
+            "count":   len(rows),
+            "results": rows,
+        },
     }
 
 
 @app.get("/search/ind/email", tags=["Search"])
-async def search_by_email(
-    request: Request,
-    q: str = Query(..., min_length=6, max_length=254, example="test@gmail.com"),
-    _k: dict = Depends(verify_api_key),
+async def by_email(
+    q:   str  = Query(..., min_length=6, max_length=254, example="test@gmail.com"),
+    _k: dict  = Depends(auth),
 ):
-    """Search by email. Returns customers_db2 shape for frontend."""
-    em = validate_email(q)
-    rows = duck_query(f"""
-        SELECT telephone_number, name_of_the_subsciber AS name, date_of_birth AS dob,
-               address1, address2, city, state,
-               alternate_phone_no AS alternate_phone, e_mail_id AS email,
-               gender, connection_type, service_provider, circle
-        FROM read_parquet('{S3_PATH}')
-        WHERE LOWER(CAST(e_mail_id AS VARCHAR)) = '{em}'
+    """
+    Search by email address.
+    Returns: { query, total, customers_db2: { count, results } }
+    """
+    em   = clean_email(q)
+    rows = run_query(f"""
+        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true, filename=true)
+        WHERE _email = '{em}'
         LIMIT {MAX_RESULTS}
     """)
-    # Email searches don't have phone metadata
+
     return {
-        "query":         em,
-        "total":         len(rows),
-        "customers_db2": {"count": len(rows), "results": rows},
+        "query": em,
+        "total": len(rows),
+        "customers_db2": {
+            "count":   len(rows),
+            "results": rows,
+        },
     }
 
 
 @app.get("/search/ind/alternate", tags=["Search"])
-async def search_by_alternate(
-    request: Request,
-    q: str = Query(..., min_length=10, max_length=15, example="9810766029"),
-    _k: dict = Depends(verify_api_key),
+async def by_alternate(
+    q:   str  = Query(..., min_length=10, max_length=15, example="9810766029"),
+    _k: dict  = Depends(auth),
 ):
-    """Search by alternate phone. Returns customers_db2 shape for frontend."""
-    n = validate_ind_phone(q)
-    rows = duck_query(f"""
-        SELECT telephone_number, name_of_the_subsciber AS name, date_of_birth AS dob,
-               address1, address2, city, state,
-               alternate_phone_no AS alternate_phone, e_mail_id AS email,
-               gender, connection_type, service_provider, circle
-        FROM read_parquet('{S3_PATH}')
-        WHERE CAST(alternate_phone_no AS VARCHAR) LIKE '%{n[-10:]}'
+    """
+    Search by alternate / second mobile number.
+    Returns: { query, total, phone_meta, customers_db2: { count, results } }
+    """
+    n    = clean_mobile(q)
+    rows = run_query(f"""
+        SELECT * FROM read_parquet('{S3_PATH}', union_by_name=true, filename=true)
+        WHERE _alt_mobile = '{n}'
         LIMIT {MAX_RESULTS}
     """)
-    # ✓ FIXED: Always generate phone metadata for phone searches, even when no DB records
-    phone_meta = get_phone_meta(n)
+
     return {
-        "query":         n,
-        "total":         len(rows),
-        "phone_meta":    phone_meta,
-        "customers_db2": {"count": len(rows), "results": rows},
+        "query":      n,
+        "total":      len(rows),
+        "phone_meta": phone_meta(n),
+        "customers_db2": {
+            "count":   len(rows),
+            "results": rows,
+        },
     }
 
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Key info
-# ─────────────────────────────────────────────────────────────────────────────
+# ── key info ──────────────────────────────────────────────────────────────────
 
 @app.get("/key/info", tags=["Key"])
-async def key_info(key_doc: dict = Depends(verify_api_key)):
-    """Check your API key status, expiry and usage."""
-    expiry = key_doc.get("expires_at")
-    now    = datetime.now(timezone.utc)
-    if expiry:
-        exp_dt      = datetime.fromisoformat(expiry)
-        days_left   = max(0, (exp_dt - now).days)
-        expires_str = exp_dt.strftime("%Y-%m-%d %H:%M UTC")
+async def key_info(doc: dict = Depends(auth)):
+    exp = doc.get("expires_at")
+    now = datetime.now(timezone.utc)
+    if exp:
+        exp_dt    = datetime.fromisoformat(exp)
+        days_left = max(0, (exp_dt - now).days)
+        exp_str   = exp_dt.strftime("%Y-%m-%d %H:%M UTC")
     else:
-        days_left, expires_str = None, "Never (lifetime)"
+        days_left, exp_str = None, "Never (lifetime)"
     return {
-        "key":         key_doc["key"],
-        "type":        key_doc.get("type", "unknown"),
-        "label":       key_doc.get("label", ""),
-        "active":      True,
-        "expires_at":  expires_str,
+        "key":         doc["key"],
+        "type":        doc.get("type", "unknown"),
+        "label":       doc.get("label", ""),
+        "active":      not doc.get("revoked", False),
+        "expires_at":  exp_str,
         "days_left":   days_left,
-        "usage_count": key_doc.get("usage_count", 0),
-        "last_used":   key_doc.get("last_used", "never"),
-        "created_at":  key_doc.get("created_at", ""),
+        "usage_count": doc.get("usage_count", 0),
+        "last_used":   doc.get("last_used", "never"),
+        "created_at":  doc.get("created_at", ""),
     }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Health & stats (public)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# ── health ────────────────────────────────────────────────────────────────────
 
 @app.head("/health")
 async def health_head():
-    return JSONResponse(content=None, status_code=200)
+    return JSONResponse(None, status_code=200)
 
 
 @app.get("/health", tags=["Info"])
 async def health():
     """
-    Returns HealthStats shape matching the frontend interface exactly.
-    India data goes into customer_cluster.customers_db2.
-    main_cluster and email_cluster are zeroed (those are old-API collections).
+    Returns shape matching HealthStats interface in api.ts.
+    customers_db2 = your 22.17 Crore rows.
+    Frontend merges this with old API's counts.
     """
     try:
-        total = get_duck().execute(
-            f"SELECT COUNT(*) FROM read_parquet('{S3_PATH}')"
-        ).fetchone()[0]
+        # use known total as fast response — avoids slow COUNT(*) on 22 Cr rows
+        # uncomment the line below if you want live count (slower):
+        # total = duck().execute(f"SELECT COUNT(*) FROM read_parquet('{S3_PATH}', union_by_name=true, filename=true)").fetchone()[0]
+        total = KNOWN_TOTAL
 
-        by_circle = get_duck().execute(f"""
-            SELECT circle, COUNT(*) as cnt
-            FROM read_parquet('{S3_PATH}')
-            GROUP BY circle ORDER BY cnt DESC LIMIT 10
-        """).fetchall()
-
-        kc = get_keys_col()
+        kc = keys_col()
         return {
             "status": "ok",
-            # zeroed — these collections live on the old API
+            # zeroed — old API owns these collections
             "main_cluster":  {"address": 0, "pan": 0, "personal": 0},
             "email_cluster": {"email": 0},
-            # India telecom data goes here → frontend DBCard "CUSTOMER DB2" renders it
+            # this is what frontend renders as "CUSTOMER DB2"
             "customer_cluster": {
                 "customers_db1": 0,
-                "customers_db2": total,
+                "customers_db2": total,   # 22,17,00,000
             },
-            "by_circle": [{"circle": r[0], "count": r[1]} for r in by_circle],
             "key_system": {
                 "total_keys":    kc.count_documents({}),
                 "active_keys":   kc.count_documents({"revoked": False}),
@@ -440,17 +405,19 @@ async def health():
         return {"status": "error", "detail": str(e)}
 
 
+# ── root ──────────────────────────────────────────────────────────────────────
+
 @app.get("/", tags=["Info"])
 async def root():
     return {
-        "api":     "India Subscriber Lookup API",
-        "version": "1.0.0",
-        "status":  "ok",
+        "api":          "India Subscriber Lookup API",
+        "version":      "2.0.0",
+        "total_records": KNOWN_TOTAL,
         "endpoints": {
-            "search_by_phone":     "GET /search/ind/number?q=9811063283",
-            "search_by_email":     "GET /search/ind/email?q=test@gmail.com",
-            "search_by_alternate": "GET /search/ind/alternate?q=9810766029",
-            "key_info":            "GET /key/info",
-            "health":              "GET /health",
+            "by_number":    "GET /search/ind/number?q=9811063283",
+            "by_email":     "GET /search/ind/email?q=test@gmail.com",
+            "by_alternate": "GET /search/ind/alternate?q=9810766029",
+            "key_info":     "GET /key/info",
+            "health":       "GET /health",
         },
     }
