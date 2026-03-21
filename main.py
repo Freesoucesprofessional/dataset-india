@@ -59,7 +59,7 @@ MAX_RESULTS   = int(os.getenv("MAX_RESULTS", "10"))
 
 # total rows in your database (22.17 Crore)
 # used as fallback if DuckDB COUNT(*) is slow
-KNOWN_TOTAL   = 93_614_386
+KNOWN_TOTAL   = 101_879_689
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
