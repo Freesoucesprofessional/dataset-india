@@ -83,59 +83,29 @@ def keys_col():
 
 
 # ── lifespan ──────────────────────────────────────────────────────────────────
-import asyncio
-
-async def _keep_alive():
-    """Ping self every 10 min to prevent Render free tier shutdown."""
-    import httpx
-    await asyncio.sleep(60)
-    while True:
-        try:
-            async with httpx.AsyncClient() as client:
-                await client.get("http://127.0.0.1:8000/ping", timeout=5)
-            log.info("keep-alive ping OK")
-        except Exception as e:
-            log.warning("keep-alive: %s", e)
-        await asyncio.sleep(600)
-
-
 @asynccontextmanager
 async def lifespan(app):
     global _duck
-
-    for attempt in range(3):
-        try:
-            _duck = duckdb.connect()
-            _duck.execute("INSTALL httpfs; LOAD httpfs;")
-            _duck.execute(f"""
-                SET s3_region            = 'auto';
-                SET s3_endpoint          = '{R2_ENDPOINT.replace("https://", "")}';
-                SET s3_access_key_id     = '{R2_ACCESS_KEY}';
-                SET s3_secret_access_key = '{R2_SECRET_KEY}';
-                SET s3_url_style         = 'path';
-            """)
-            log.info("DuckDB connected")
-            break
-        except Exception as e:
-            log.error("DuckDB attempt %s: %s", attempt+1, e)
-            if attempt == 2: raise
-            await asyncio.sleep(2)
+    _duck = duckdb.connect()
+    _duck.execute("INSTALL httpfs; LOAD httpfs;")
+    _duck.execute(f"""
+        SET s3_region            = 'auto';
+        SET s3_endpoint          = '{R2_ENDPOINT.replace("https://", "")}';
+        SET s3_access_key_id     = '{R2_ACCESS_KEY}';
+        SET s3_secret_access_key = '{R2_SECRET_KEY}';
+        SET s3_url_style         = 'path';
+    """)
+    log.info("DuckDB → R2  %s", S3_PATH)
 
     try:
         keys_col().database.client.admin.command("ping")
-        log.info("MongoDB OK — %s keys", keys_col().count_documents({}))
+        n = keys_col().count_documents({})
+        log.info("MongoDB keystore OK  —  %s keys", n)
     except Exception as e:
         log.error("MongoDB: %s", e)
 
-    task = asyncio.create_task(_keep_alive())
-
     yield
 
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
     if _duck:   _duck.close()
     if _mongo:  _mongo.close()
 
@@ -419,13 +389,6 @@ async def key_info(doc: dict = Depends(auth)):
 
 
 # ── health ────────────────────────────────────────────────────────────────────
-
-
-@app.get("/ping", tags=["Info"], include_in_schema=False)
-async def ping():
-    """Keep-alive endpoint — called internally every 10 min."""
-    return {"ok": True}
-
 
 @app.head("/health")
 async def health_head():
