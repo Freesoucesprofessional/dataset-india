@@ -1,26 +1,12 @@
 """
-India Subscriber Lookup API  —  v3.0
+India Subscriber Lookup API  —  v4.0
 512MB Render free tier compatible.
 
-How it works:
-  1. At startup, loads mobile_index.parquet from R2 into RAM (~475MB)
-  2. Each search looks up which parquet file contains the number (1ms)
-  3. Fetches ONLY that 1 file from R2 (~500ms)
-  4. Total query time: ~1 second instead of 30-120 seconds
-
-Install:
-  pip install fastapi uvicorn duckdb pymongo python-dotenv phonenumbers
-
-.env:
-  R2_ENDPOINT   = https://<account>.r2.cloudflarestorage.com
-  R2_ACCESS_KEY = ...
-  R2_SECRET_KEY = ...
-  MONGO_KEY_URL = mongodb+srv://...
-  KEY_DB_NAME   = keystore
-  MAX_RESULTS   = 10
-
-Run:
-  uvicorn api:app --host 0.0.0.0 --port 8000
+Strategy:
+  - NO index preloaded in RAM at startup
+  - Each query fetches only 1 small index part from R2 (~10MB avg)
+  - Then fetches only the matching data files
+  - Max RAM per query: ~150MB (idx_98 worst case)
 """
 
 import re, os, logging
@@ -45,7 +31,7 @@ R2_ENDPOINT   = os.getenv("R2_ENDPOINT", "")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 BUCKET        = "india-data"
-INDEX_FILE    = "mobile_index.parquet/mobile_index.parquet"
+INDEX_PARTS   = "index_parts"
 MONGO_URL     = os.getenv("MONGO_KEY_URL", "")
 KEY_DB        = os.getenv("KEY_DB_NAME", "keystore")
 MAX_RESULTS   = int(os.getenv("MAX_RESULTS", "10"))
@@ -77,11 +63,10 @@ def keys_col():
 async def lifespan(app):
     global _duck
 
-    _duck = duckdb.connect()  # in-memory, no file
-    _duck.execute("SET memory_limit = '400MB';")
-    _duck.execute("SET threads = 1;")  # free tier = 1 shared CPU
-
-    # configure R2
+    # in-memory only — no index preload
+    _duck = duckdb.connect()
+    _duck.execute("SET memory_limit = '350MB';")
+    _duck.execute("SET threads = 1;")
     _duck.execute("INSTALL httpfs; LOAD httpfs;")
     _duck.execute(f"""
         SET s3_region            = 'auto';
@@ -90,24 +75,7 @@ async def lifespan(app):
         SET s3_secret_access_key = '{R2_SECRET_KEY}';
         SET s3_url_style         = 'path';
     """)
-
-    # load index into RAM — this is the key to fast queries
-    index_url = f"s3://{BUCKET}/{INDEX_FILE}"
-    log.info("Loading index from R2: %s", index_url)
-
-    _duck.execute(f"""
-        CREATE TABLE mobile_index AS
-        SELECT * FROM read_parquet('{index_url}')
-    """)
-
-    count = _duck.execute("SELECT COUNT(*) FROM mobile_index").fetchone()[0]
-    log.info("Index loaded: %s rows", f"{count:,}")
-
-    # build in-memory indexes for instant lookup
-    _duck.execute("CREATE INDEX midx_mobile     ON mobile_index (_mobile)")
-    _duck.execute("CREATE INDEX midx_alt_mobile ON mobile_index (_alt_mobile)")
-    _duck.execute("CREATE INDEX midx_email      ON mobile_index (_email)")
-    log.info("In-memory indexes ready ✅")
+    log.info("DuckDB ready — on-demand index mode ✅")
 
     try:
         keys_col().database.client.admin.command("ping")
@@ -117,7 +85,6 @@ async def lifespan(app):
         log.error("MongoDB: %s", e)
 
     yield
-
     if _duck:  _duck.close()
     if _mongo: _mongo.close()
 
@@ -125,7 +92,7 @@ async def lifespan(app):
 # ── app ───────────────────────────────────────────────────
 app = FastAPI(
     title="India Subscriber API",
-    version="3.0.0",
+    version="4.0.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -245,26 +212,59 @@ _NAME_COLS = {
 }
 
 
-# ── core: index lookup → fetch rows ───────────────────────
-def find_files(col: str, val: str) -> list[str]:
-    """
-    Look up which parquet files contain this value.
-    Uses in-memory index — returns in ~1ms.
-    """
-    rows = duck().execute(f"""
-        SELECT DISTINCT _file
-        FROM mobile_index
-        WHERE {col} = ?
-        LIMIT 20
-    """, [val]).fetchall()
-    return [r[0] for r in rows]
+# ── core: find files via index part ───────────────────────
+def find_files_by_mobile(mobile: str) -> list[str]:
+    """Fetch only the small index part for this prefix."""
+    prefix   = mobile[:2]
+    idx_url  = f"s3://{BUCKET}/{INDEX_PARTS}/idx_{prefix}.parquet"
+    try:
+        rows = duck().execute(f"""
+            SELECT DISTINCT _file
+            FROM read_parquet('{idx_url}')
+            WHERE _mobile = ?
+            LIMIT 20
+        """, [mobile]).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error("find_files_by_mobile: %s", e)
+        return []
+
+
+def find_files_by_alt(mobile: str) -> list[str]:
+    """Alt mobile — search by prefix of alt number."""
+    prefix  = mobile[:2]
+    idx_url = f"s3://{BUCKET}/{INDEX_PARTS}/idx_{prefix}.parquet"
+    try:
+        rows = duck().execute(f"""
+            SELECT DISTINCT _file
+            FROM read_parquet('{idx_url}')
+            WHERE _alt_mobile = ?
+            LIMIT 20
+        """, [mobile]).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error("find_files_by_alt: %s", e)
+        return []
+
+
+def find_files_by_email(email: str) -> list[str]:
+    """Email — must scan all index parts (not partitioned by email)."""
+    idx_url = f"s3://{BUCKET}/{INDEX_PARTS}/idx_*.parquet"
+    try:
+        rows = duck().execute(f"""
+            SELECT DISTINCT _file
+            FROM read_parquet('{idx_url}', union_by_name=true)
+            WHERE _email = ?
+            LIMIT 20
+        """, [email]).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error("find_files_by_email: %s", e)
+        return []
 
 
 def fetch_rows(files: list[str], col: str, val: str) -> list[dict]:
-    """
-    Fetch full rows from R2 for only the matching files.
-    Only downloads 1-3 files instead of all 856.
-    """
+    """Fetch full rows from R2 for only the matching data files."""
     if not files:
         return []
 
@@ -283,7 +283,6 @@ def fetch_rows(files: list[str], col: str, val: str) -> list[dict]:
         for row in rel.fetchall():
             r = {}
             name_found = False
-
             for c, v in zip(cols, row):
                 if c in ("_mobile", "_alt_mobile", "_email", "filename"):
                     continue
@@ -297,14 +296,12 @@ def fetch_rows(files: list[str], col: str, val: str) -> list[dict]:
                 if not name_found and c.strip().lower() in _NAME_COLS:
                     r["name"] = s
                     name_found = True
-
             if r:
                 rows.append(r)
 
         return rows
-
     except Exception as e:
-        log.error("fetch_rows error: %s", e)
+        log.error("fetch_rows: %s", e)
         raise HTTPException(500, f"Query error: {e}")
 
 
@@ -316,7 +313,7 @@ async def by_number(
     _k: dict = Depends(auth),
 ):
     n     = clean_mobile(q)
-    files = find_files("_mobile", n)
+    files = find_files_by_mobile(n)
     rows  = fetch_rows(files, "_mobile", n)
     return {
         "query":      n,
@@ -332,7 +329,7 @@ async def by_email(
     _k: dict = Depends(auth),
 ):
     em    = clean_email(q)
-    files = find_files("_email", em)
+    files = find_files_by_email(em)
     rows  = fetch_rows(files, "_email", em)
     return {
         "query": em,
@@ -347,7 +344,7 @@ async def by_alternate(
     _k: dict = Depends(auth),
 ):
     n     = clean_mobile(q)
-    files = find_files("_alt_mobile", n)
+    files = find_files_by_alt(n)
     rows  = fetch_rows(files, "_alt_mobile", n)
     return {
         "query":      n,
@@ -418,7 +415,7 @@ async def health():
 async def root():
     return {
         "api":           "India Subscriber Lookup API",
-        "version":       "3.0.0",
+        "version":       "4.0.0",
         "total_records": KNOWN_TOTAL,
         "endpoints": {
             "by_number":    "GET /search/ind/number?q=9811063283",
