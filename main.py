@@ -303,6 +303,9 @@ def fetch_rows(files: list[str], col: str, val: str) -> list[dict]:
     if not files:
         return []
 
+    # limit to 5 files max to avoid RAM issues with 24 files
+    files = files[:5]
+
     s3_files  = [f"s3://{BUCKET}/{f}" for f in files]
     file_list = ", ".join(f"'{f}'" for f in s3_files)
 
@@ -310,16 +313,22 @@ def fetch_rows(files: list[str], col: str, val: str) -> list[dict]:
         rel  = duck().execute(f"""
             SELECT * FROM read_parquet([{file_list}], union_by_name=true)
             WHERE {col} = ?
-            LIMIT {MAX_RESULTS}
+            LIMIT {MAX_RESULTS * 3}
         """, [val])
         cols = [d[0] for d in rel.description]
         rows = []
+        seen_mobiles = set()  # dedup by mobile
 
         for row in rel.fetchall():
             r = {}
             name_found = False
+            mobile_val = None
+
             for c, v in zip(cols, row):
-                if c in ("_mobile", "_alt_mobile", "_email", "filename"):
+                if c == "_mobile":
+                    mobile_val = str(v).strip() if v else None
+                    continue
+                if c in ("_alt_mobile", "_email", "filename"):
                     continue
                 if v is None:
                     continue
@@ -331,8 +340,19 @@ def fetch_rows(files: list[str], col: str, val: str) -> list[dict]:
                 if not name_found and c.strip().lower() in _NAME_COLS:
                     r["name"] = s
                     name_found = True
-            if r:
-                rows.append(r)
+
+            if not r:
+                continue
+
+            # dedup by mobile — skip if already seen
+            dedup_key = mobile_val or str(r)
+            if dedup_key in seen_mobiles:
+                continue
+            seen_mobiles.add(dedup_key)
+            rows.append(r)
+
+            if len(rows) >= MAX_RESULTS:
+                break
 
         return rows
     except Exception as e:
