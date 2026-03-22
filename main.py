@@ -31,7 +31,7 @@ R2_ENDPOINT   = os.getenv("R2_ENDPOINT", "")
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 BUCKET        = "india-data"
-INDEX_PARTS   = "index_parts"
+INDEX_PARTS   = "index_parts_v2"
 MONGO_URL     = os.getenv("MONGO_KEY_URL", "")
 KEY_DB        = os.getenv("KEY_DB_NAME", "keystore")
 MAX_RESULTS   = int(os.getenv("MAX_RESULTS", "10"))
@@ -215,7 +215,7 @@ _NAME_COLS = {
 # ── core: find files via index part ───────────────────────
 def find_files_by_mobile(mobile: str) -> list[str]:
     """Fetch only the small index part for this prefix."""
-    prefix   = mobile[:2]
+    prefix   = mobile[:3]
     idx_url  = f"s3://{BUCKET}/{INDEX_PARTS}/idx_{prefix}.parquet"
     try:
         rows = duck().execute(f"""
