@@ -1,17 +1,19 @@
 """
-India Subscriber Lookup API  —  v4.0
+India Subscriber Lookup API  —  v4.1
 512MB Render free tier compatible.
 
 Strategy:
   - NO index preloaded in RAM at startup
-  - Each query fetches only 1 small index part from R2 (~10MB avg)
+  - Mobile: loads only 1 small index part by 3-digit prefix (~10MB avg)
+  - Email: loads only 1 small index part by domain (~5MB avg)
   - Then fetches only the matching data files
-  - Max RAM per query: ~150MB (idx_98 worst case)
+  - Max RAM per query: ~150MB
 """
 
-import re, os, logging
+import re, os, logging, time as _time
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from collections import OrderedDict
 
 import duckdb
 import phonenumbers
@@ -32,10 +34,18 @@ R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 BUCKET        = "india-data"
 INDEX_PARTS   = "index_parts_v2"
+EMAIL_INDEX   = "email_index_parts"
 MONGO_URL     = os.getenv("MONGO_KEY_URL", "")
 KEY_DB        = os.getenv("KEY_DB_NAME", "keystore")
 MAX_RESULTS   = int(os.getenv("MAX_RESULTS", "10"))
-KNOWN_TOTAL   = 99_413_949
+KNOWN_TOTAL   = 100_549_011
+
+# top email domains that have their own index file
+EMAIL_KNOWN = {
+    "gmail", "yahoo", "hotmail", "rediffmail",
+    "pinelabs", "fitternity", "ymail", "live",
+    "outlook", "icloud",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
@@ -43,6 +53,27 @@ log = logging.getLogger(__name__)
 # ── globals ───────────────────────────────────────────────
 _duck:  duckdb.DuckDBPyConnection | None = None
 _mongo: MongoClient | None = None
+
+# ── LRU cache ─────────────────────────────────────────────
+_cache: OrderedDict = OrderedDict()
+CACHE_MAX = 200
+CACHE_TTL = 300  # 5 minutes
+
+def cache_get(key: str):
+    if key in _cache:
+        val, ts = _cache[key]
+        if _time.time() - ts < CACHE_TTL:
+            _cache.move_to_end(key)
+            return val
+        del _cache[key]
+    return None
+
+def cache_set(key: str, val):
+    if key in _cache:
+        _cache.move_to_end(key)
+    _cache[key] = (val, _time.time())
+    if len(_cache) > CACHE_MAX:
+        _cache.popitem(last=False)
 
 
 def duck():
@@ -63,7 +94,6 @@ def keys_col():
 async def lifespan(app):
     global _duck
 
-    # in-memory only — no index preload
     _duck = duckdb.connect()
     _duck.execute("SET memory_limit = '350MB';")
     _duck.execute("SET threads = 1;")
@@ -92,7 +122,7 @@ async def lifespan(app):
 # ── app ───────────────────────────────────────────────────
 app = FastAPI(
     title="India Subscriber API",
-    version="4.0.0",
+    version="4.1.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -212,11 +242,10 @@ _NAME_COLS = {
 }
 
 
-# ── core: find files via index part ───────────────────────
+# ── find files ────────────────────────────────────────────
 def find_files_by_mobile(mobile: str) -> list[str]:
-    """Fetch only the small index part for this prefix."""
-    prefix   = mobile[:3]
-    idx_url  = f"s3://{BUCKET}/{INDEX_PARTS}/idx_{prefix}.parquet"
+    prefix  = mobile[:3]
+    idx_url = f"s3://{BUCKET}/{INDEX_PARTS}/idx_{prefix}.parquet"
     try:
         rows = duck().execute(f"""
             SELECT DISTINCT _file
@@ -231,8 +260,7 @@ def find_files_by_mobile(mobile: str) -> list[str]:
 
 
 def find_files_by_alt(mobile: str) -> list[str]:
-    """Alt mobile — search by prefix of alt number."""
-    prefix  = mobile[:2]
+    prefix  = mobile[:3]
     idx_url = f"s3://{BUCKET}/{INDEX_PARTS}/idx_{prefix}.parquet"
     try:
         rows = duck().execute(f"""
@@ -248,23 +276,30 @@ def find_files_by_alt(mobile: str) -> list[str]:
 
 
 def find_files_by_email(email: str) -> list[str]:
-    """Email — must scan all index parts (not partitioned by email)."""
-    idx_url = f"s3://{BUCKET}/{INDEX_PARTS}/idx_*.parquet"
+    em = email.lower().strip()
+    try:
+        domain = em.split("@")[1].split(".")[0]
+    except:
+        domain = "other"
+
+    part    = domain if domain in EMAIL_KNOWN else "other"
+    idx_url = f"s3://{BUCKET}/{EMAIL_INDEX}/email_{part}.parquet"
+
     try:
         rows = duck().execute(f"""
             SELECT DISTINCT _file
-            FROM read_parquet('{idx_url}', union_by_name=true)
+            FROM read_parquet('{idx_url}')
             WHERE _email = ?
             LIMIT 20
-        """, [email]).fetchall()
+        """, [em]).fetchall()
         return [r[0] for r in rows]
     except Exception as e:
         log.error("find_files_by_email: %s", e)
         return []
 
 
+# ── fetch full rows ───────────────────────────────────────
 def fetch_rows(files: list[str], col: str, val: str) -> list[dict]:
-    """Fetch full rows from R2 for only the matching data files."""
     if not files:
         return []
 
@@ -312,15 +347,23 @@ async def by_number(
     q:  str  = Query(..., min_length=10, max_length=15, example="9811063283"),
     _k: dict = Depends(auth),
 ):
-    n     = clean_mobile(q)
+    n = clean_mobile(q)
+
+    cached = cache_get(f"mob:{n}")
+    if cached:
+        log.info("Cache hit: %s", n)
+        return cached
+
     files = find_files_by_mobile(n)
     rows  = fetch_rows(files, "_mobile", n)
-    return {
+    result = {
         "query":      n,
         "total":      len(rows),
         "phone_meta": phone_meta(n),
         "customers_db2": {"count": len(rows), "results": rows},
     }
+    cache_set(f"mob:{n}", result)
+    return result
 
 
 @app.get("/search/ind/email", tags=["Search"])
@@ -328,14 +371,22 @@ async def by_email(
     q:  str  = Query(..., min_length=6, max_length=254, example="test@gmail.com"),
     _k: dict = Depends(auth),
 ):
-    em    = clean_email(q)
+    em = clean_email(q)
+
+    cached = cache_get(f"eml:{em}")
+    if cached:
+        log.info("Cache hit: %s", em)
+        return cached
+
     files = find_files_by_email(em)
     rows  = fetch_rows(files, "_email", em)
-    return {
+    result = {
         "query": em,
         "total": len(rows),
         "customers_db2": {"count": len(rows), "results": rows},
     }
+    cache_set(f"eml:{em}", result)
+    return result
 
 
 @app.get("/search/ind/alternate", tags=["Search"])
@@ -343,15 +394,23 @@ async def by_alternate(
     q:  str  = Query(..., min_length=10, max_length=15, example="9810766029"),
     _k: dict = Depends(auth),
 ):
-    n     = clean_mobile(q)
+    n = clean_mobile(q)
+
+    cached = cache_get(f"alt:{n}")
+    if cached:
+        log.info("Cache hit: %s", n)
+        return cached
+
     files = find_files_by_alt(n)
     rows  = fetch_rows(files, "_alt_mobile", n)
-    return {
+    result = {
         "query":      n,
         "total":      len(rows),
         "phone_meta": phone_meta(n),
         "customers_db2": {"count": len(rows), "results": rows},
     }
+    cache_set(f"alt:{n}", result)
+    return result
 
 
 # ── key info ──────────────────────────────────────────────
@@ -415,7 +474,7 @@ async def health():
 async def root():
     return {
         "api":           "India Subscriber Lookup API",
-        "version":       "4.0.0",
+        "version":       "4.1.0",
         "total_records": KNOWN_TOTAL,
         "endpoints": {
             "by_number":    "GET /search/ind/number?q=9811063283",
@@ -425,3 +484,7 @@ async def root():
             "health":       "GET /health",
         },
     }
+
+
+# ── keep Render awake ─────────────────────────────────────
+# (handled by frontend keep-alive ping every 10 mins)
